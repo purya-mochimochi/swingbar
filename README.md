@@ -27,3 +27,10 @@ Features a clean, Scoreboard-inspired dark plate interface rendered using Ashita
 
    In-game, load the addon via the chat console:
    /addon load swingbar
+
+## References & Credits
+- **Original Source / Algorithm:**  
+  - [XivUI by maybeLynd](https://github.com/maybeLynd/XivUI)  
+  - The interval estimation logic is adapted from XivUI's `castbar.lua` component.
+- **Port & Redesign:**  
+  - Re-implemented and redesigned for Ashita v4 using native ImGui.
