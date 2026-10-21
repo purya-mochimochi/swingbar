@@ -1,7 +1,7 @@
 addon.name      = 'swingbar'
-addon.author    = 'Chiro (Logic adapted from maybeLynd)'
-addon.version   = '1.0'
-addon.desc      = 'swing bar for ashita'
+addon.author    = 'purya-mochimochi (Logic adapted from maybeLynd)'
+addon.version   = '1.1'
+addon.desc      = 'Auto-attack swing bar with dynamic hit counter & Ready! display'
 addon.link      = 'https://github.com/purya-mochimochi/swingbar'
 
 local imgui  = require('imgui')
@@ -13,21 +13,29 @@ local settings = {
     show_melee  = true,
     show_ranged = true,
     show_text   = true,
-    width       = 160.0,
-    height      = 5.0,
+    show_tphits = true,
+    opacity     = 0.88,
+    width       = 175.0,  -- バーの横幅
+    height      = 5.0,    -- バーの太さ
     x           = nil,
     y           = nil,
 }
 
 -- タイマー管理テーブル
-local swing  = { last = nil, est = 3.0, hits = 1, landed = false }
-local ranged = { last = nil, est = 5.0, hits = 1 }
+local swing  = { last = nil, est = 3.0, landed = false }
+local ranged = { last = nil, est = 5.0 }
 
-local SWING_MIN, SWING_FLOOR, SWING_CEIL    = 0.3, 0.8, 10.0
-local RANGED_MIN, RANGED_FLOOR, RANGED_CEIL = 0.3, 1.0, 20.0
+-- TP追跡用テーブル
+local tp_state = {
+    last_tp    = 0,
+    tp_per_hit = nil,
+}
+
+local SWING_MIN, SWING_FLOOR, SWING_CEIL    = 1.2, 1.0, 10.0
+local RANGED_MIN, RANGED_FLOOR, RANGED_CEIL = 1.0, 1.5, 20.0
 local reposition_pending = false
 
--- 状態異常バフID定義（スタン 28 は除外）
+-- 状態異常バフID定義
 local BUFF_SLEEP_1    = 2
 local BUFF_PARALYSIS  = 4
 local BUFF_PETRIFY    = 7
@@ -35,7 +43,6 @@ local BUFF_CHARM      = 14
 local BUFF_SLEEP_2    = 19
 local BUFF_TERROR     = 193
 
--- 行動停止系（持続する睡眠、石化、テラー、魅了）
 local INCAPACITATED_BUFFS = {
     [BUFF_SLEEP_1] = true,
     [BUFF_SLEEP_2] = true,
@@ -91,6 +98,19 @@ local function get_my_id()
     return party:GetMemberServerId(0)
 end
 
+-- 自キャラの現在TP取得
+local function get_my_tp()
+    local party = AshitaCore:GetMemoryManager():GetParty()
+    if not party then return 0 end
+
+    local tp = party:GetMemberTP(0)
+    if tp then
+        return tp
+    end
+
+    return 0
+end
+
 -- 近接スイング進行度計算 (0.0 ～ 1.0)
 local function get_swing_progress()
     if not is_engaged() then
@@ -104,7 +124,6 @@ local function get_swing_progress()
     local now = socket.gettime()
     local is_incap, _ = check_player_buffs()
 
-    -- 睡眠・石化中の一時停止（フリーズ）処理
     if is_incap then
         if not is_incapacitated_prev then
             freeze_start_time = now
@@ -138,7 +157,6 @@ ashita.events.register('packet_in', 'packet_in_cb', function (e)
     local my_id = get_my_id()
     if not my_id or my_id == 0 then return end
 
-    -- 麻痺ログの検知 (0x029)
     if e.id == 0x029 then
         local actor_id = struct.unpack('I', e.data, 0x05 + 1)
         if actor_id == my_id then
@@ -169,20 +187,36 @@ ashita.events.register('packet_in', 'packet_in_cb', function (e)
         if swing.last then
             local d = now - swing.last
 
-            -- 麻痺中、復帰直後、または魔法詠唱後でなければ予測ディレイを更新
-            if not is_para and not skip_next_est_update then
+            if d >= SWING_FLOOR and d <= SWING_CEIL and not is_para and not skip_next_est_update then
                 if not swing.est then
-                    swing.est = math.min(SWING_CEIL, math.max(SWING_FLOOR, d))
+                    swing.est = d
+                elseif math.abs(d - swing.est) > (swing.est * 0.3) and d < (swing.est * 2.0) then
+                    swing.est = swing.est * 0.5 + d * 0.5
                 elseif d >= swing.est * 0.6 and d <= swing.est * 1.7 then
                     swing.est = swing.est * 0.7 + d * 0.3
-                elseif d < swing.est * 0.6 then
-                    swing.est = math.max(SWING_FLOOR, swing.est * 0.8 + d * 0.2)
-                elseif d <= swing.est * 2.5 then
-                    swing.est = math.min(SWING_CEIL, swing.est * 0.85 + d * 0.15)
                 end
             end
             skip_next_est_update = false
         end
+
+        -- 獲得TPの計測と学習
+        local current_tp = get_my_tp()
+        if tp_state.last_tp and current_tp > tp_state.last_tp then
+            local gain = current_tp - tp_state.last_tp
+            if gain >= 30 and gain <= 300 then
+                if not tp_state.tp_per_hit then
+                    tp_state.tp_per_hit = gain
+                else
+                    if gain < tp_state.tp_per_hit then
+                        tp_state.tp_per_hit = gain
+                    elseif gain <= tp_state.tp_per_hit * 1.15 then
+                        tp_state.tp_per_hit = math.floor(tp_state.tp_per_hit * 0.8 + gain * 0.2 + 0.5)
+                    end
+                end
+            end
+        end
+        tp_state.last_tp = current_tp
+
         swing.last = now
         swing.landed = true
 
@@ -194,25 +228,16 @@ ashita.events.register('packet_in', 'packet_in_cb', function (e)
             local d = now - ranged.last
             if not ranged.est then
                 ranged.est = math.min(RANGED_CEIL, math.max(RANGED_FLOOR, d))
-            elseif d >= ranged.est * 0.6 and d <= ranged.est * 1.7 then
-                ranged.est = ranged.est * 0.7 + d * 0.3
-            elseif d < ranged.est * 0.6 then
-                ranged.est = math.max(RANGED_FLOOR, ranged.est * 0.8 + d * 0.2)
-            elseif d <= ranged.est * 2.5 then
-                ranged.est = math.min(RANGED_CEIL, ranged.est * 0.85 + d * 0.15)
+            else
+                ranged.est = ranged.est * 0.85 + d * 0.15
             end
         end
+
         ranged.last = now
 
-    -- 【追加】Category 4: 魔法詠唱完了 / Category 8: 魔法詠唱開始
-    -- 魔法詠唱によって通常攻撃の間隔が伸びるため、次回の通常攻撃時はディレイ予測の学習をスキップ
-    elseif category == 4 or category == 8 then
+    elseif category == 3 or category == 4 or category == 8 then
         skip_next_est_update = true
-
-    -- 【追加】Category 3: ウェポンスキル発動
-    -- WS直後の通常攻撃も間隔がズレるため同様にスキップ
-    elseif category == 3 then
-        skip_next_est_update = true
+        tp_state.last_tp = get_my_tp()
     end
 end)
 
@@ -237,9 +262,12 @@ ashita.events.register('d3d_present', 'd3d_present_cb', function ()
         reposition_pending = false
     end
 
-    imgui.PushStyleColor(ImGuiCol_WindowBg, { 0.05, 0.05, 0.05, 0.88 })
+    local bg_alpha    = math.max(0.0, math.min(1.0, settings.opacity))
+    local frame_alpha = math.min(1.0, bg_alpha + 0.1)
+
+    imgui.PushStyleColor(ImGuiCol_WindowBg, { 0.05, 0.05, 0.05, bg_alpha })
     imgui.PushStyleColor(ImGuiCol_Border,   { 0.00, 0.00, 0.00, 0.00 })
-    imgui.PushStyleColor(ImGuiCol_FrameBg,  { 0.15, 0.15, 0.15, 0.90 })
+    imgui.PushStyleColor(ImGuiCol_FrameBg,  { 0.15, 0.15, 0.15, frame_alpha })
 
     imgui.PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0)
     imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, { 10.0, 8.0 })
@@ -265,15 +293,32 @@ ashita.events.register('d3d_present', 'd3d_present_cb', function ()
 
                 imgui.TextColored(label_col, label_text)
                 imgui.SameLine()
+
+                -- 秒数表示（緑色）
                 local time_str = string.format('   %.1fs', swing.est or 3.0)
                 imgui.TextColored({ 0.20, 0.85, 0.30, 1.00 }, time_str)
+
+                -- 残り振り数（[1hit] / [2hits]）または Ready! の表示
+                if settings.show_tphits then
+                    local current_tp = get_my_tp()
+                    if current_tp >= 1000 then
+                        imgui.SameLine()
+                        imgui.TextColored({ 1.00, 0.82, 0.20, 1.00 }, ' Ready!')
+                    elseif tp_state.tp_per_hit and tp_state.tp_per_hit > 0 then
+                        local needed = 1000 - current_tp
+                        local left_swings = math.ceil(needed / tp_state.tp_per_hit)
+                        local unit_str = (left_swings == 1) and 'hit' or 'hits'
+                        imgui.SameLine()
+                        imgui.TextColored({ 0.20, 0.85, 0.30, 1.00 }, string.format(' [%d%s]', left_swings, unit_str))
+                    end
+                end
             end
 
             local bar_color = { 0.18, 0.80, 0.35, 1.00 }
             if is_incap then
-                bar_color = { 0.45, 0.45, 0.45, 0.90 }    -- 睡眠・石化時: 暗いグレー
+                bar_color = { 0.45, 0.45, 0.45, 0.90 }
             elseif is_para then
-                bar_color = { 0.95, 0.60, 0.15, 1.00 }    -- 麻痺時: オレンジ
+                bar_color = { 0.95, 0.60, 0.15, 1.00 }
             end
 
             imgui.PushStyleColor(ImGuiCol_PlotHistogram, bar_color)
@@ -323,7 +368,24 @@ ashita.events.register('command', 'command_cb', function (e)
     end
 
     e.blocked = true
-    local sub_cmd = args[2] and args[2]:lower() or ''
+
+    local function show_help()
+        print('[SwingBar] Command List:')
+        print('  /sb pos <x> <y>        - Move window to coordinates.')
+        print('  /sb size <w> [h]       - Set bar width and height (e.g. /sb size 180 6).')
+        print('  /sb opacity <0.0..1.0> - Set background opacity.')
+        print('  /sb tp                 - Toggle remaining hits to 1000 TP.')
+        print('  /sb text               - Toggle interval text.')
+        print('  /sb melee              - Toggle melee swing bar.')
+        print('  /sb ranged             - Toggle ranged attack bar.')
+    end
+
+    if #args == 1 or not args[2] then
+        show_help()
+        return
+    end
+
+    local sub_cmd = args[2]:lower()
 
     if sub_cmd == 'pos' then
         local x = tonumber(args[3])
@@ -332,24 +394,43 @@ ashita.events.register('command', 'command_cb', function (e)
             settings.x = x
             settings.y = y
             reposition_pending = true
-            print(string.format('[SwingBar] 座標を X:%d, Y:%d に設定しました。', x, y))
+            print(string.format('[SwingBar] Window position set to X:%d, Y:%d', x, y))
         else
-            print('[SwingBar] 使用法: /sb pos <x> <y>')
+            print('[SwingBar] Usage: /sb pos <x> <y>')
         end
+    elseif sub_cmd == 'size' or sub_cmd == 'scale' then
+        local w = tonumber(args[3])
+        local h = tonumber(args[4])
+        if w then
+            settings.width = math.max(80.0, math.min(500.0, w))
+            if h then
+                settings.height = math.max(2.0, math.min(30.0, h))
+            end
+            print(string.format('[SwingBar] Bar size set to Width:%.0f, Height:%.0f', settings.width, settings.height))
+        else
+            print('[SwingBar] Usage: /sb size <width> [height] (e.g. /sb size 180 6)')
+        end
+    elseif sub_cmd == 'opacity' or sub_cmd == 'alpha' then
+        local val = tonumber(args[3])
+        if val then
+            settings.opacity = math.max(0.0, math.min(1.0, val))
+            print(string.format('[SwingBar] Background opacity set to %.2f', settings.opacity))
+        else
+            print('[SwingBar] Usage: /sb opacity <0.0..1.0>')
+        end
+    elseif sub_cmd == 'tp' or sub_cmd == 'tphits' then
+        settings.show_tphits = not settings.show_tphits
+        print('[SwingBar] Remaining hits to 1000 TP: ' .. (settings.show_tphits and 'ON' or 'OFF'))
     elseif sub_cmd == 'text' then
         settings.show_text = not settings.show_text
-        print('[SwingBar] テキスト表示: ' .. (settings.show_text and 'ON' or 'OFF'))
+        print('[SwingBar] Interval text: ' .. (settings.show_text and 'ON' or 'OFF'))
     elseif sub_cmd == 'melee' then
         settings.show_melee = not settings.show_melee
-        print('[SwingBar] 近接バー: ' .. (settings.show_melee and 'ON' or 'OFF'))
+        print('[SwingBar] Melee bar: ' .. (settings.show_melee and 'ON' or 'OFF'))
     elseif sub_cmd == 'ranged' then
         settings.show_ranged = not settings.show_ranged
-        print('[SwingBar] 遠隔バー: ' .. (settings.show_ranged and 'ON' or 'OFF'))
+        print('[SwingBar] Ranged bar: ' .. (settings.show_ranged and 'ON' or 'OFF'))
     else
-        print('[SwingBar] コマンド一覧:')
-        print('  /sb pos <x> <y> - 指定した座標へ移動')
-        print('  /sb text        - 秒数テキストの表示切り替え')
-        print('  /sb melee       - 近接バーの有効/無効')
-        print('  /sb ranged      - 遠隔バーの有効/無効')
+        show_help()
     end
 end)
